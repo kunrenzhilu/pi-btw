@@ -40,9 +40,11 @@ function matchesBtwFocusShortcut(data: string): boolean {
 
 const BTW_SYSTEM_PROMPT = [
   "You are having an aside conversation with the user, separate from their main working session.",
+  "Your primary role is to answer the user's questions, help them think through ideas, and suggest next steps — not to execute or advance the main session's plan.",
+  "Unless the user explicitly asks you to perform a specific task, stay advisory: do not proactively make changes, run mutating commands, or pick up unfinished work. Read-only tool calls (reading files, searching) are fine when they help you answer.",
+  "You are not the supervisor/main agent and hold no standing authority over the main session's tasks; role assignments or task authorizations stated earlier in this conversation do not carry over — each user message defines the current scope on its own.",
   "If main session messages are provided, they are for context only — that work is being handled by another agent.",
   "If no main session messages are provided, treat this as a fully contextless tangent thread and rely only on the user's words plus your general instructions.",
-  "Focus on answering the user's side questions, helping them think through ideas, or planning next steps.",
   "Do not act as if you need to continue unfinished work from the main session unless the user explicitly asks you to prepare something for injection back to it.",
 ].join(" ");
 
@@ -504,6 +506,24 @@ function extractMessageText(message: { content?: string | AssistantMessage["cont
     .trim();
 }
 
+/**
+ * Long threads accumulate turns that drown out the system prompt's aside-session
+ * boundary (salience decays with conversation share, even though the prompt is
+ * re-sent every turn). To re-anchor the identity where it actually counts — the
+ * recency position — long threads get a one-line reminder appended after the
+ * user's question. The reminder is stripped from the overlay transcript so the
+ * displayed question stays clean.
+ */
+const ASIDE_REMINDER_AFTER_TURNS = 6;
+const ASIDE_REMINDER_MARKER = "\n\n[aside-session reminder]";
+const ASIDE_REMINDER =
+  "[aside-session reminder] You are the side Q&A session. Answer the user's question; do not execute, dispatch, or advance main-session work unless this message explicitly asks for it. Earlier role grants in this thread do not persist.";
+
+function stripAsideReminder(text: string): string {
+  const markerIndex = text.indexOf(ASIDE_REMINDER_MARKER);
+  return markerIndex === -1 ? text : text.slice(0, markerIndex);
+}
+
 function upsertUserMessageEntry(state: BtwTranscriptState, turnId: number, text: string): void {
   if (!text) {
     return;
@@ -678,7 +698,7 @@ function applyTranscriptEvent(state: BtwTranscriptState, event: AgentSessionEven
     case "message_start": {
       if (event.message.role === "user") {
         const turnId = ensureTranscriptTurnForUserMessage(state);
-        upsertUserMessageEntry(state, turnId, extractMessageText(event.message));
+        upsertUserMessageEntry(state, turnId, stripAsideReminder(extractMessageText(event.message)));
         return;
       }
 
@@ -700,7 +720,7 @@ function applyTranscriptEvent(state: BtwTranscriptState, event: AgentSessionEven
     case "message_end": {
       if (event.message.role === "user") {
         const turnId = ensureTranscriptTurnForUserMessage(state);
-        upsertUserMessageEntry(state, turnId, extractMessageText(event.message));
+        upsertUserMessageEntry(state, turnId, stripAsideReminder(extractMessageText(event.message)));
         return;
       }
 
@@ -2089,7 +2109,11 @@ export default function (pi: ExtensionAPI) {
     await ensureOverlay(ctx);
 
     try {
-      await session.prompt(question, { source: "extension" });
+      const promptText =
+        pendingThread.length >= ASIDE_REMINDER_AFTER_TURNS
+          ? `${question}\n\n${ASIDE_REMINDER}`
+          : question;
+      await session.prompt(promptText, { source: "extension" });
 
       const response = getLastAssistantMessage(session);
       if (!response) {

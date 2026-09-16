@@ -1129,6 +1129,38 @@ describe("btw runtime behavior", () => {
     expect(harness.baseCtx.isIdle()).toBe(true);
   });
 
+  it("queues an overlay submit while streaming and runs it after the current request settles", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingSuccessStream("first answer");
+    promptStreamMock.mockImplementation(() => blocking.stream());
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "first question");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    const record = subSessionRecords[0];
+    expect(record.getIsStreaming()).toBe(true);
+
+    // Second submit while the first is streaming: must queue, not prompt again.
+    overlay.input.onSubmit?.("second question");
+    await flushAsyncWork();
+
+    expect(overlay.statusText.text).toContain("Queued");
+    expect(record.session.prompt).toHaveBeenCalledTimes(1);
+
+    blocking.release();
+    await pendingCommand;
+    await flushAsyncWork();
+
+    // Drained automatically after the first request settles.
+    expect(record.session.prompt).toHaveBeenCalledTimes(2);
+    expect(record.session.prompt).toHaveBeenLastCalledWith(expect.stringContaining("second question"), {
+      source: "extension",
+    });
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
+  });
+
   it("dismisses immediately on Escape when the side session is idle", async () => {
     const harness = createHarness();
 

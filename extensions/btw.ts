@@ -1343,6 +1343,12 @@ export default function (pi: ExtensionAPI) {
   let overlayRuntime: OverlayRuntime | null = null;
   let lastUiContext: ExtensionContext | ExtensionCommandContext | null = null;
   let activeBtwSession: BtwSessionRuntime | null = null;
+  // Overlay submits have no built-in queue: AgentSession.prompt() throws when
+  // called while the side session is streaming unless streamingBehavior is
+  // set. Queue concurrent asks here and drain them after the current one
+  // settles, mirroring how the main window queues typed input.
+  let btwRequestInFlight = false;
+  const btwQueue: Array<{ question: string; save: boolean }> = [];
 
   function syncUi(ctx?: ExtensionContext | ExtensionCommandContext): void {
     const activeCtx = ctx ?? lastUiContext;
@@ -1478,6 +1484,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function dismissOverlaySession(): Promise<void> {
+    btwQueue.length = 0;
     dismissOverlay();
     await disposeBtwSession();
   }
@@ -1986,6 +1993,7 @@ export default function (pi: ExtensionAPI) {
     persist = true,
     mode: BtwThreadMode = "contextual",
   ): Promise<void> {
+    btwQueue.length = 0;
     await disposeBtwSession();
     pendingThread = [];
     pendingMode = mode;
@@ -2069,6 +2077,31 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function runBtw(
+    ctx: ExtensionCommandContext,
+    question: string,
+    saveRequested: boolean,
+    mode: BtwThreadMode,
+  ): Promise<void> {
+    if (btwRequestInFlight) {
+      btwQueue.push({ question, save: saveRequested });
+      setOverlayStatus(`⏳ Queued (${btwQueue.length}) — runs after the current request.`, ctx);
+      return;
+    }
+    btwRequestInFlight = true;
+    try {
+      await runBtwInner(ctx, question, saveRequested, mode);
+    } finally {
+      btwRequestInFlight = false;
+      const next = btwQueue.shift();
+      if (next) {
+        void runBtw(ctx, next.question, next.save, pendingMode).catch(() => {
+          // Drain errors are already reported by runBtwInner's own catch.
+        });
+      }
+    }
+  }
+
+  async function runBtwInner(
     ctx: ExtensionCommandContext,
     question: string,
     saveRequested: boolean,

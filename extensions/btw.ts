@@ -1050,6 +1050,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   private readonly onSubmitCallback: (value: string) => void;
   private readonly onDismissCallback: () => void;
   private readonly onUnfocusCallback: () => void;
+  private readonly inputHistoryController?: { remember(value: string): void; up(): string | null; down(): string | null };
   private readonly tui: TUI;
   private readonly theme: ExtensionContext["ui"]["theme"];
   private transcriptLines: string[] = [];
@@ -1081,6 +1082,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     onSubmit: (value: string) => void,
     onDismiss: () => void,
     onUnfocus: () => void,
+    inputHistory?: { remember(value: string): void; up(): string | null; down(): string | null },
   ) {
     super();
     this.tui = tui;
@@ -1088,6 +1090,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.readTranscriptEntries = readTranscriptEntries;
     this.getStatus = getStatus;
     this.getMode = getMode;
+    this.inputHistoryController = inputHistory;
     this.onSubmitCallback = onSubmit;
     this.onDismissCallback = onDismiss;
     this.onUnfocusCallback = onUnfocus;
@@ -1205,13 +1208,31 @@ class BtwOverlayComponent extends Container implements Focusable {
       return;
     }
 
-    if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.up)) {
+    const isUp = matchesKey(data, Key.up);
+    const isDown = matchesKey(data, Key.down);
+
+    // Empty input: Up/Down recall submitted questions (main-session style);
+    // non-empty input keeps them as transcript scrolling, like PgUp/PgDn.
+    if ((isUp || isDown) && this.input.getValue() === "" && this.inputHistoryController) {
+      const recalled = isUp ? this.inputHistoryController.up() : this.inputHistoryController.down();
+      if (recalled !== null) {
+        this.input.setValue(recalled);
+        // Put the cursor at the end so the user can continue typing where the
+        // recalled question left off (setValue keeps the old cursor, which was
+        // 0 on an empty input).
+        this.input.handleInput("\x1b[F"); // End key -> cursorLineEnd
+        this.tui.requestRender();
+      }
+      return;
+    }
+
+    if (matchesKey(data, Key.pageUp) || isUp) {
       const step = matchesKey(data, Key.pageUp) ? Math.max(1, this.transcriptViewportHeight - 1) : 1;
       this.scrollTranscript(-step);
       return;
     }
 
-    if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.down)) {
+    if (matchesKey(data, Key.pageDown) || isDown) {
       const step = matchesKey(data, Key.pageDown) ? Math.max(1, this.transcriptViewportHeight - 1) : 1;
       this.scrollTranscript(step);
       return;
@@ -1326,7 +1347,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     const status = this.getStatus() ?? "Ready. Enter submits; Escape dismisses without clearing.";
     this.statusTextValue = status;
     this.statusText.setText(this.statusTextValue);
-    this.hintsTextValue = "Scroll wheel ↑↓ PgUp/PgDn · Enter · Alt+/ focus · Esc";
+    this.hintsTextValue = "Wheel/PgUp/PgDn scroll · ↑↓ history (empty input) · Enter · Alt+/ focus · Esc";
     this.hintsText.setText(this.hintsTextValue);
     this.tui.requestRender();
   }
@@ -1349,6 +1370,33 @@ export default function (pi: ExtensionAPI) {
   // settles, mirroring how the main window queues typed input.
   let btwRequestInFlight = false;
   const btwQueue: Array<{ question: string; save: boolean }> = [];
+
+  // Submitted-question history for ↑/↓ recall in the overlay input (empty
+  // input only). Survives overlay reopen within the pi session.
+  const inputHistory: string[] = [];
+  let inputHistoryIndex = 0;
+  const inputHistoryController = {
+    remember(value: string): void {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      if (inputHistory[inputHistory.length - 1] === trimmed) {
+        inputHistoryIndex = inputHistory.length;
+        return;
+      }
+      inputHistory.push(trimmed);
+      if (inputHistory.length > 50) inputHistory.shift();
+      inputHistoryIndex = inputHistory.length;
+    },
+    up(): string | null {
+      if (inputHistory.length === 0) return null;
+      if (inputHistoryIndex > 0) inputHistoryIndex--;
+      return inputHistory[inputHistoryIndex] ?? null;
+    },
+    down(): string | null {
+      if (inputHistoryIndex < inputHistory.length) inputHistoryIndex++;
+      return inputHistoryIndex < inputHistory.length ? inputHistory[inputHistoryIndex] : "";
+    },
+  };
 
   function syncUi(ctx?: ExtensionContext | ExtensionCommandContext): void {
     const activeCtx = ctx ?? lastUiContext;
@@ -1735,6 +1783,7 @@ export default function (pi: ExtensionAPI) {
               overlayRuntime?.handle?.unfocus();
               overlayRuntime?.refresh?.();
             },
+            inputHistoryController,
           );
 
           overlay.focused = runtime.handle?.isFocused() ?? true;
@@ -2108,6 +2157,7 @@ export default function (pi: ExtensionAPI) {
     mode: BtwThreadMode,
   ): Promise<void> {
     lastUiContext = ctx;
+    inputHistoryController.remember(question);
     const settings = await resolveBtwSettings(ctx);
     const model = settings.model;
     if (!model) {

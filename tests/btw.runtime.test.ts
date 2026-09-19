@@ -75,11 +75,13 @@ class FakeOverlayHandle {
 const tuiMocks = vi.hoisted(() => {
   class FakeInput {
     value = "";
+    cursor = 0;
     focused = false;
     onSubmit?: (value: string) => void;
     onEscape?: () => void;
     setValue(value: string) {
       this.value = value;
+      this.cursor = Math.min(this.cursor, value.length);
     }
     getValue() {
       return this.value;
@@ -87,7 +89,19 @@ const tuiMocks = vi.hoisted(() => {
     render(_width: number) {
       return [`> ${this.value}`];
     }
-    handleInput(_data: string) {}
+    handleInput(data: string) {
+      // Emulate the real Input contract the extension relies on: End moves the
+      // cursor to line end; printable single chars insert at the cursor.
+      // Control sequences (escape, ctrl+c, ...) stay no-ops.
+      if (data === "\x1b[F" || data === "\x05") {
+        this.cursor = this.value.length;
+        return;
+      }
+      if (data.length === 1 && data >= " " && data !== "\x7f") {
+        this.value = this.value.slice(0, this.cursor) + data + this.value.slice(this.cursor);
+        this.cursor += 1;
+      }
+    }
   }
 
   class FakeContainer {
@@ -1575,6 +1589,50 @@ describe("btw runtime behavior", () => {
     expect(secondRender[0]).toContain("─");
     expect(secondRender.at(-1)).toContain("─");
     expect(firstRender.length).toBe(secondRender.length);
+  });
+
+  it("recalls the last submitted question with ArrowUp when the overlay input is empty", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("answer one"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first question");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    expect(overlay.input.getValue()).toBe("");
+
+    overlay.handleInput("\x1b[A"); // ArrowUp recalls at component level
+    expect(overlay.input.getValue()).toBe("first question");
+
+    // Non-empty input keeps ArrowUp as transcript scrolling — no recall clobber.
+    overlay.focused = true;
+    overlay.input.handleInput("x");
+    const before = overlay.input.getValue();
+    overlay.handleInput("\x1b[A");
+    expect(overlay.input.getValue()).toBe(before);
+  });
+
+  it("recalls the aborted question after Escape-abort so it can be completed", async () => {
+    const harness = createHarness();
+    const blocking = createBlockingToolStream();
+    promptStreamMock.mockImplementation(() => blocking.stream());
+
+    await harness.runSessionStart();
+    const pendingCommand = harness.command("btw", "half typed question");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onEscape?.(); // abort, overlay stays open
+    await flushAsyncWork();
+    expect(overlay.statusText.text).toContain("Press Esc again to dismiss");
+
+    blocking.release();
+    await pendingCommand;
+    await flushAsyncWork();
+
+    overlay.handleInput("\x1b[A"); // ArrowUp recalls the aborted question
+    expect(overlay.input.getValue()).toBe("half typed question");
   });
 
   it("keeps the BTW modal at a fixed reading height, uses one frame color, and preserves stacked body indentation", async () => {

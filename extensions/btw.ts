@@ -551,17 +551,25 @@ function truncateHeadAndTail(text: string, head: number, tail: number): string {
   return `${text.slice(0, head)}\n…[truncated，共 ${text.length} chars，省略 ${omitted}]…\n${text.slice(text.length - tail)}`;
 }
 
+function normalizeContent(message: SeedMessage): Array<{ type: string; text?: string }> {
+  const content = message.content;
+  if (typeof content === "string") {
+    // pi-ai UserMessage.content allows a bare string; session files are parsed
+    // without validation, so normalize here instead of crashing the renderer.
+    return [{ type: "text", text: content }];
+  }
+  return content ?? [];
+}
+
 function contentToPlainText(message: SeedMessage): string {
-  const content = (message as { content?: Array<{ type: string; text?: string }> }).content ?? [];
-  return content
-    .filter((block) => block.type === "text" && typeof block.text === "string")
-    .map((block) => block.text as string)
+  return normalizeContent(message)
+    .map((block) => (block.type === "image" ? "[image omitted]" : block.type === "text" ? block.text ?? "" : ""))
     .join("\n")
     .trim();
 }
 
 function bashExecutionToTranscriptText(message: SeedMessage): string {
-  const m = message as { command?: string; output?: string; exitCode?: number | null; cancelled?: boolean };
+  const m = message as { command?: string; output?: string; exitCode?: number | null; cancelled?: boolean; truncated?: boolean; fullOutputPath?: string };
   let text = `Ran \`${m.command ?? ""}\``;
   text += m.output ? `\n\`\`\`\n${m.output}\n\`\`\`` : "\n(no output)";
   if (m.cancelled) {
@@ -569,13 +577,17 @@ function bashExecutionToTranscriptText(message: SeedMessage): string {
   } else if (m.exitCode !== null && m.exitCode !== undefined && m.exitCode !== 0) {
     text += `\n\nCommand exited with code ${m.exitCode}`;
   }
+  if (m.truncated && m.fullOutputPath) {
+    text += `\n\n[Output truncated. Full output: ${m.fullOutputPath}]`;
+  }
   return text;
 }
 
 /** Loose shape: buildSessionContext emits more roles than pi-ai's Message union (compactionSummary, branchSummary, bashExecution, custom...). */
 type SeedMessage = {
   role: string;
-  content?: Array<{ type: string; text?: string; name?: string; arguments?: unknown }>;
+  content?: Array<{ type: string; text?: string; name?: string; arguments?: unknown }> | string;
+  toolName?: string;
   summary?: string;
   name?: string;
   arguments?: unknown;
@@ -600,7 +612,9 @@ export function renderMainTranscript(messages: SeedMessage[]): string {
     const role = message.role as string;
     switch (role) {
       case "user": {
-        const parts = (message.content ?? []).map((block) => (block.type === "image" ? "[image omitted]" : block.text ?? ""));
+        const parts = normalizeContent(message).map((block) =>
+          block.type === "image" ? "[image omitted]" : block.text ?? "",
+        );
         const text = parts.join("\n").trim();
         if (text) {
           blocks.push(`--- [main] user ---\n${text}`);
@@ -608,11 +622,21 @@ export function renderMainTranscript(messages: SeedMessage[]): string {
         break;
       }
       case "assistant": {
-        const textParts: string[] = [];
-        for (const block of message.content ?? []) {
+        // Emit blocks in original order (text and tool calls interleaved as the
+        // assistant produced them) instead of flattening all text into one block.
+        let textBuffer: string[] = [];
+        const flushText = () => {
+          const text = textBuffer.join("\n").trim();
+          if (text) {
+            blocks.push(`--- [main] assistant ---\n${text}`);
+          }
+          textBuffer = [];
+        };
+        for (const block of normalizeContent(message)) {
           if (block.type === "text" && block.text?.trim()) {
-            textParts.push(block.text);
+            textBuffer.push(block.text);
           } else if (block.type === "toolCall") {
+            flushText();
             const toolName = (block as { name?: string }).name ?? "unknown";
             let args: string;
             try {
@@ -626,16 +650,16 @@ export function renderMainTranscript(messages: SeedMessage[]): string {
           }
           // thinking blocks are deliberately dropped
         }
-        const text = textParts.join("\n").trim();
-        if (text) {
-          blocks.push(`--- [main] assistant ---\n${text}`);
-        }
+        flushText();
         break;
       }
       case "toolResult": {
         const text = contentToPlainText(message);
         if (text) {
-          blocks.push(`--- [main] tool result ---\n${truncateHeadAndTail(text, TRANSCRIPT_TOOL_RESULT_HEAD, TRANSCRIPT_TOOL_RESULT_TAIL)}`);
+          const toolName = message.toolName ?? "unknown";
+          blocks.push(
+            `--- [main] tool result: ${toolName} ---\n${truncateHeadAndTail(text, TRANSCRIPT_TOOL_RESULT_HEAD, TRANSCRIPT_TOOL_RESULT_TAIL)}`,
+          );
         }
         break;
       }

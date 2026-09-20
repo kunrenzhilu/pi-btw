@@ -3158,17 +3158,22 @@ describe("renderMainTranscript", () => {
     expect(renderMainTranscript([])).toBe("");
   });
 
-  it("drops thinking blocks and keeps visible text and tool calls", () => {
+  it("drops thinking blocks and keeps visible text and tool calls in original order", () => {
     const out = renderMainTranscript([
       assistant([
         { type: "thinking", thinking: "secret reasoning" },
         { type: "text", text: "visible answer" },
         { type: "toolCall", name: "bash", arguments: { command: "ls" } },
+        { type: "text", text: "after the call" },
       ]),
     ]);
+    const at = (needle: string) => out.indexOf(needle);
     expect(out).toContain("--- [main] assistant ---\nvisible answer");
     expect(out).toContain("--- [main] assistant → tool call: bash ---");
     expect(out).toContain('"command":"ls"');
+    expect(out).toContain("after the call");
+    expect(at("visible answer")).toBeLessThan(at("tool call: bash"));
+    expect(at("tool call: bash")).toBeLessThan(at("after the call"));
     expect(out).not.toContain("secret reasoning");
   });
 
@@ -3182,7 +3187,8 @@ describe("renderMainTranscript", () => {
 
   it("tail-keeps oversized tool results (head 1000 + tail 3000)", () => {
     const body = `${"A".repeat(1500)}${"B".repeat(3200)}ERROR-AT-END`;
-    const out = renderMainTranscript([{ role: "toolResult", content: [{ type: "text", text: body }] }]);
+    const out = renderMainTranscript([{ role: "toolResult", toolName: "bash", content: [{ type: "text", text: body }] }]);
+    expect(out).toContain("--- [main] tool result: bash ---");
     expect(out).toContain("ERROR-AT-END");
     expect(out).toContain("…[truncated，共 ");
     expect(out).toContain("A".repeat(1000));

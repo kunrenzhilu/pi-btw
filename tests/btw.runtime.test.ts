@@ -1384,12 +1384,14 @@ describe("btw runtime behavior", () => {
     expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(0);
     expect(overlay.statusText.text).toContain("Press Esc again to dismiss");
 
-    // The aborted request settles without persisting a completed exchange, while
+    // The aborted request settles and is persisted as an aborted exchange, while
     // its partial user/tool transcript remains readable.
     blocking.release();
     await pendingCommand;
     expect(firstRecord.getIsStreaming()).toBe(false);
-    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(0);
+    const abortedEntries = getCustomEntries(harness.entries, "btw-thread-entry");
+    expect(abortedEntries).toHaveLength(1);
+    expect(abortedEntries[0]?.data).toMatchObject({ aborted: true, question: "first question" });
     expect(transcriptText(overlay)).toContain("first question");
     expect(transcriptText(overlay)).toContain("read");
 
@@ -1398,7 +1400,7 @@ describe("btw runtime behavior", () => {
     await flushAsyncWork();
 
     expect(firstRecord.session.prompt).toHaveBeenLastCalledWith("follow-up after abort", { source: "extension" });
-    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
     expect(transcriptText(overlay)).toContain("first question");
     expect(transcriptText(overlay)).toContain("follow-up after abort");
     expect(transcriptText(overlay)).toContain("Recovered after abort");
@@ -1412,7 +1414,7 @@ describe("btw runtime behavior", () => {
     expect(harness.overlayHandles.at(-1)?.hideCalls).toBe(1);
   });
 
-  it("keeps partial assistant output visible without counting or persisting an aborted exchange", async () => {
+  it("persists an aborted exchange while keeping partial assistant output visible", async () => {
     const harness = createHarness();
     const blocking = createBlockingPartialAbortStream();
     promptStreamMock.mockImplementation(() => blocking.stream());
@@ -1434,8 +1436,10 @@ describe("btw runtime behavior", () => {
       text: "Partial answer",
       streaming: false,
     });
-    expect(overlay.summaryText.text).toContain("0 exchanges");
-    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(0);
+    expect(overlay.summaryText.text).toContain("1 exchange");
+    const abortedEntries = getCustomEntries(harness.entries, "btw-thread-entry");
+    expect(abortedEntries).toHaveLength(1);
+    expect(abortedEntries[0]?.data).toMatchObject({ aborted: true, question: "partial question" });
   });
 
   it("waits for abort settlement before submitting a follow-up", async () => {
@@ -1480,7 +1484,7 @@ describe("btw runtime behavior", () => {
     expect(record.session.prompt).toHaveBeenNthCalledWith(3, "second follow-up while cancelling", { source: "extension" });
     expect(record.session.abort).toHaveBeenCalledTimes(1);
     expect(record.session.dispose).not.toHaveBeenCalled();
-    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
+    expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(3);
     expect(transcriptText(overlay)).toContain("First follow-up after cancellation");
     expect(transcriptText(overlay)).toContain("Second follow-up after cancellation");
     expect(transcriptText(overlay)).not.toContain("Agent is already processing");

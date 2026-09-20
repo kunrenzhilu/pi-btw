@@ -194,6 +194,8 @@ type BtwDetails = {
   thinkingLevel: SessionThinkingLevel;
   timestamp: number;
   usage?: AssistantMessage["usage"];
+  /** True when the turn was aborted (Esc) before completing; the exchange is still persisted. */
+  aborted?: boolean;
 };
 
 type ParsedBtwArgs = {
@@ -392,6 +394,41 @@ function extractAnswer(message: AssistantMessage): string {
 
 function extractThinking(message: AssistantMessage): string {
   return extractText(message.content, "thinking");
+}
+
+/**
+ * Build the persisted answer text for an aborted turn: whatever text was streamed
+ * before the abort, plus the tool calls that were dispatched (results are lost with
+ * the in-memory session, so record at least what was attempted).
+ */
+function buildAbortedAnswer(message: AssistantMessage): string {
+  const parts: string[] = [];
+  const text = extractText(message.content, "text");
+  if (text) {
+    parts.push(text);
+  }
+  const toolCallLines = message.content
+    .filter((block) => block.type === "toolCall")
+    .map((block) => {
+      const toolCall = block as { name: string; arguments?: unknown };
+      let args: string;
+      try {
+        args = JSON.stringify(toolCall.arguments ?? {});
+      } catch {
+        args = "?";
+      }
+      if (args.length > 200) {
+        args = `${args.slice(0, 200)}…`;
+      }
+      return `- ${toolCall.name}(${args})`;
+    });
+  if (toolCallLines.length > 0) {
+    parts.push(`[Tool calls dispatched before the abort; results were not captured]\n${toolCallLines.join("\n")}`);
+  }
+  if (parts.length === 0) {
+    parts.push("(aborted before any output)");
+  }
+  return `${parts.join("\n\n")}\n\n[turn aborted by user]`;
 }
 
 function parseBtwArgs(args: string): ParsedBtwArgs {
@@ -956,18 +993,23 @@ function hasStreamingTranscriptEntry(entries: BtwTranscript): boolean {
   );
 }
 
-function getCompletedExchangeCount(entries: BtwTranscript): number {
-  const completedTurnIds = new Set(
+/**
+ * Count exchanges in the transcript that belong to the persisted thread:
+ * completed turns plus aborted turns (which are persisted as `aborted` thread
+ * entries). Failed turns are transient and not persisted, so they don't count.
+ */
+function getThreadExchangeCount(entries: BtwTranscript): number {
+  const threadTurnIds = new Set(
     entries.flatMap((entry) =>
       entry.type === "turn-boundary" &&
       entry.phase === "end" &&
-      (entry.outcome === undefined || entry.outcome === "completed")
+      (entry.outcome === undefined || entry.outcome === "completed" || entry.outcome === "aborted")
         ? [entry.turnId]
         : [],
     ),
   );
   return entries.filter(
-    (entry) => entry.type === "assistant-text" && !entry.streaming && completedTurnIds.has(entry.turnId),
+    (entry) => entry.type === "assistant-text" && !entry.streaming && threadTurnIds.has(entry.turnId),
   ).length;
 }
 
@@ -1577,7 +1619,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.modeTextValue = `${getOverlayTitle(this.getMode())} · hidden thread preserved`;
     this.modeText.setText(this.modeTextValue);
     const entries = this.readTranscriptEntries();
-    const exchanges = getCompletedExchangeCount(entries);
+    const exchanges = getThreadExchangeCount(entries);
     const active = hasStreamingTranscriptEntry(entries) ? " · streaming" : " · idle";
     this.summaryTextValue = `${exchanges} exchange${exchanges === 1 ? "" : "s"}${active}`;
     this.summaryText.setText(this.summaryTextValue);
@@ -2516,7 +2558,24 @@ export default function (pi: ExtensionAPI) {
       if (response.stopReason === "aborted") {
         const abortedTurnId = transcriptState.currentTurnId ?? transcriptState.lastTurnId;
         finishTranscriptTurn(transcriptState, abortedTurnId, "aborted");
-        setOverlayStatus("⏹ Aborted. Press Esc again to dismiss the BTW overlay.", ctx);
+        // Persist the aborted turn so the work is not lost with the in-memory
+        // aside session. The entry is marked `aborted` and still feeds the seed
+        // for follow-up turns, so the aside remembers what it was doing.
+        const details: BtwDetails = {
+          question,
+          thinking: extractThinking(response) || "",
+          answer: buildAbortedAnswer(response),
+          provider: model.provider,
+          model: model.id,
+          api: model.api,
+          thinkingLevel,
+          timestamp: Date.now(),
+          usage: response.usage,
+          aborted: true,
+        };
+        pendingThread.push(details);
+        pi.appendEntry(BTW_ENTRY_TYPE, details);
+        setOverlayStatus("⏹ Aborted. Turn preserved in the BTW thread. Press Esc again to dismiss the overlay.", ctx);
         return;
       }
       if (response.stopReason === "error") {

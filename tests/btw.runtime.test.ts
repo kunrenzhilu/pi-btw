@@ -1660,6 +1660,31 @@ describe("btw runtime behavior", () => {
     expect(harness.sentUserMessages[0]?.content).not.toContain("aborted question");
   });
 
+  it("anchors the aside identity at the end of a fresh contextual seed and excludes it from handoff", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("Fresh thread answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "who are you");
+    await flushAsyncWork();
+
+    const record = subSessionRecords[0];
+    const seed = record.seedMessages ?? [];
+    expect(seed.length).toBeGreaterThanOrEqual(2);
+    const seedText = (message: any) => message.content.map((block: any) => block.text ?? "").join("");
+    expect(seed.at(-2)).toMatchObject({ role: "user" });
+    expect(seedText(seed.at(-2))).toContain("You are the aside session");
+    expect(seed.at(-1)).toMatchObject({ role: "assistant" });
+    expect(seedText(seed.at(-1))).toContain("I am the aside session");
+
+    await harness.command("btw:inject", "");
+    expect(harness.sentUserMessages.length).toBeGreaterThan(0);
+    const content = String(harness.sentUserMessages.at(-1)?.content);
+    expect(content).toContain("who are you");
+    expect(content).toContain("Fresh thread answer");
+    expect(content).not.toContain("You are the aside session");
+  });
+
   it("allows main-session input to proceed while the BTW sub-session is streaming", async () => {
     const harness = createHarness();
     const blocking = createBlockingSuccessStream("Long-running answer");

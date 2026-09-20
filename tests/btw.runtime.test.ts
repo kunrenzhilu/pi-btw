@@ -499,6 +499,23 @@ function transcriptText(overlay: any): string {
   return overlay.transcript.children.map((child: any) => child.text).join("\n");
 }
 
+/** Width-mode helpers: the overlay defaults to full-width; switch on demand. */
+async function ensureWindowMode(harness: any): Promise<void> {
+  const options = harness.overlays.at(-1)?.factoryOptions?.overlayOptions;
+  if (options?.width !== "78%") {
+    harness.latestOverlayComponent().handleInput("\x1bw");
+    await flushAsyncWork();
+  }
+}
+
+async function ensureFullMode(harness: any): Promise<void> {
+  const options = harness.overlays.at(-1)?.factoryOptions?.overlayOptions;
+  if (options?.width === "78%") {
+    harness.latestOverlayComponent().handleInput("\x1bw");
+    await flushAsyncWork();
+  }
+}
+
 function transcriptEntries(overlay: any) {
   overlay.refresh();
   return overlay.getTranscriptEntries();
@@ -1685,6 +1702,48 @@ describe("btw runtime behavior", () => {
     expect(content).not.toContain("You are the aside session");
   });
 
+  it("re-anchors the aside identity with a per-turn reminder on long threads", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("Long thread answer"));
+
+    await harness.runSessionStart();
+    for (let turn = 1; turn <= 7; turn++) {
+      await harness.command("btw", `question ${turn}`);
+      await flushAsyncWork();
+    }
+
+    const record = subSessionRecords[0];
+    const prompts = record.promptCalls.map((call: any) => call.text);
+    // Turns 1-6 prompt with pendingThread.length 0-5: no reminder yet.
+    for (let index = 0; index < 6; index++) {
+      expect(prompts[index]).not.toContain("[aside-session reminder]");
+    }
+    // Turn 7 prompts with pendingThread.length 6: reminder re-anchors identity.
+    expect(prompts[6]).toContain("[aside-session reminder]");
+    expect(prompts[6]).toContain("question 7");
+    // The reminder never reaches the transcript or the persisted thread entry.
+    expect(transcriptText(harness.latestOverlayComponent())).not.toContain("[aside-session reminder]");
+    const entries = getCustomEntries(harness.entries, "btw-thread-entry");
+    expect(entries).toHaveLength(7);
+    expect((entries.at(-1)?.data as any)?.question).toBe("question 7");
+  });
+
+  it("recalls previous questions with ArrowUp on empty overlay input", async () => {
+    const harness = createHarness();
+    promptStreamMock.mockImplementation(() => streamAnswer("recall answer"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "first recalled question");
+    await flushAsyncWork();
+
+    const overlay = harness.latestOverlayComponent();
+    expect(overlay.input.getValue()).toBe("");
+    overlay.handleInput("\x1b[A"); // ArrowUp
+    expect(overlay.input.getValue()).toBe("first recalled question");
+    overlay.handleInput("\x1b[B"); // ArrowDown back to empty
+    expect(overlay.input.getValue()).toBe("");
+  });
+
   it("allows main-session input to proceed while the BTW sub-session is streaming", async () => {
     const harness = createHarness();
     const blocking = createBlockingSuccessStream("Long-running answer");
@@ -2199,7 +2258,7 @@ describe("btw runtime behavior", () => {
     expect(harness.widgets.some((entry) => entry.key === "btw" && typeof entry.content === "function")).toBe(false);
   });
 
-  it("defaults to the framed window width and advertises the Alt+w width toggle", async () => {
+  it("defaults to full-width and advertises the Alt+w width toggle", async () => {
     const harness = createHarness();
     promptStreamMock.mockImplementation(() => streamAnswer("Overlay answer"));
 
@@ -2207,8 +2266,8 @@ describe("btw runtime behavior", () => {
     await harness.command("btw", "overlay question");
 
     expect(harness.overlays.at(-1)?.factoryOptions?.overlayOptions).toMatchObject({
-      width: "78%",
-      margin: { top: 1, left: 2, right: 2 },
+      width: "100%",
+      margin: { top: 1 },
     });
 
     const overlay = harness.latestOverlayComponent();
@@ -2216,7 +2275,7 @@ describe("btw runtime behavior", () => {
     expect(overlay.hintsText.text).toContain("Alt+w width");
   });
 
-  it("toggles the overlay between window and full-width layouts on Alt+w, preserving the draft", async () => {
+  it("toggles the overlay between full-width and window layouts on Alt+w, preserving the draft", async () => {
     const harness = createHarness();
     promptStreamMock.mockImplementation(() => streamAnswer("Overlay answer"));
 
@@ -2226,20 +2285,9 @@ describe("btw runtime behavior", () => {
     const overlay = harness.latestOverlayComponent();
     overlay.setDraft("kept draft");
 
-    // Alt+w (legacy ESC-prefixed) switches to full-width and re-opens the overlay.
+    // Default is full-width; Alt+w (legacy ESC-prefixed) switches to the framed
+    // window layout and re-opens the overlay.
     overlay.handleInput("\x1bw");
-    await flushAsyncWork();
-
-    expect(harness.overlays.at(-1)?.factoryOptions?.overlayOptions).toMatchObject({
-      width: "100%",
-      margin: { top: 1 },
-    });
-    const fullOverlay = harness.latestOverlayComponent();
-    expect(fullOverlay.getDraft()).toBe("kept draft");
-    expect(fullOverlay.statusText.text).toContain("Full-width mode");
-
-    // Alt+w again restores the framed window layout.
-    await harness.shortcut("alt+w");
     await flushAsyncWork();
 
     expect(harness.overlays.at(-1)?.factoryOptions?.overlayOptions).toMatchObject({
@@ -2249,6 +2297,18 @@ describe("btw runtime behavior", () => {
     const windowOverlay = harness.latestOverlayComponent();
     expect(windowOverlay.getDraft()).toBe("kept draft");
     expect(windowOverlay.statusText.text).toContain("Window mode");
+
+    // Alt+w again restores the full-width layout.
+    await harness.shortcut("alt+w");
+    await flushAsyncWork();
+
+    expect(harness.overlays.at(-1)?.factoryOptions?.overlayOptions).toMatchObject({
+      width: "100%",
+      margin: { top: 1 },
+    });
+    const fullOverlay = harness.latestOverlayComponent();
+    expect(fullOverlay.getDraft()).toBe("kept draft");
+    expect(fullOverlay.statusText.text).toContain("Full-width mode");
   });
 
   it("keeps the box frame in window mode but drops all border glyphs in full-width mode", async () => {
@@ -2258,17 +2318,7 @@ describe("btw runtime behavior", () => {
     await harness.runSessionStart();
     await harness.command("btw", "overlay question");
 
-    // Window mode: full box frame with corners and vertical bars.
-    const windowRender = harness.latestOverlayComponent().render(80);
-    expect(windowRender[0]).toContain("┌");
-    expect(windowRender.at(-1)).toContain("└");
-    expect(windowRender.some((line: string) => line.includes("│"))).toBe(true);
-
-    const overlay = harness.latestOverlayComponent();
-    overlay.handleInput("\x1bw");
-    await flushAsyncWork();
-
-    // Full-width mode: horizontal rules only, no corners and no side bars, so a
+    // Full-width (default): horizontal rules only, no corners and no side bars, so a
     // Shift+drag selection can't pick up border glyphs beside the text.
     const fullRender = harness.latestOverlayComponent().render(80);
     expect(fullRender[0]).toContain("─");
@@ -2277,6 +2327,16 @@ describe("btw runtime behavior", () => {
     expect(fullRender.at(-1)).not.toContain("└");
     expect(fullRender.at(-1)).not.toContain("┘");
     expect(fullRender.every((line: string) => !line.includes("│"))).toBe(true);
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.handleInput("\x1bw");
+    await flushAsyncWork();
+
+    // Window mode: full box frame with corners and vertical bars.
+    const windowRender = harness.latestOverlayComponent().render(80);
+    expect(windowRender[0]).toContain("┌");
+    expect(windowRender.at(-1)).toContain("└");
+    expect(windowRender.some((line: string) => line.includes("│"))).toBe(true);
   });
 
   it("does not change Pi-owned terminal mouse reporting in fullscreen mode", async () => {
@@ -2384,6 +2444,7 @@ describe("btw runtime behavior", () => {
 
     await harness.runSessionStart();
     await harness.command("btw", "first question");
+    await ensureWindowMode(harness);
 
     const overlay = harness.latestOverlayComponent();
     const firstRender = overlay.render(80);
@@ -2413,6 +2474,7 @@ describe("btw runtime behavior", () => {
 
     await harness.runSessionStart();
     await harness.command("btw", "");
+    await ensureWindowMode(harness);
 
     const overlay = harness.latestOverlayComponent();
     const emptyLines = overlay.render(80);
@@ -3007,6 +3069,7 @@ describe("btw runtime behavior", () => {
     const harness = createHarness();
     await harness.runSessionStart();
     await harness.command("btw", "");
+    await ensureWindowMode(harness);
     const overlay = harness.latestOverlayComponent();
 
     overlay.setDraft("x".repeat(200));
@@ -3048,6 +3111,7 @@ describe("btw runtime behavior", () => {
           const harness = createHarness();
           await harness.runSessionStart();
           await harness.command("btw", "");
+          await ensureWindowMode(harness);
           const overlay = harness.latestOverlayComponent();
           const lines = overlay.render(80) as string[];
           const maxHeight = resolveOverlayMaxHeight(rows);

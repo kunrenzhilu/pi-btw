@@ -167,7 +167,26 @@ const BTW_SYSTEM_PROMPT = [
   "If no main session messages are provided, treat this as a fully contextless tangent thread and rely only on the user's words plus your general instructions.",
   "Focus on answering the user's side questions, helping them think through ideas, or planning next steps.",
   "Do not act as if you need to continue unfinished work from the main session unless the user explicitly asks you to prepare something for injection back to it.",
+  "Your primary role is to answer the user's questions, help them think through ideas, and suggest next steps — not to execute or advance the main session's plan.",
+  "Unless the user explicitly asks you to perform a specific task, stay advisory: do not proactively make changes, run mutating commands, or pick up unfinished work. Read-only tool calls (reading files, searching) are fine when they help you answer.",
+  "You are not the supervisor/main agent and hold no standing authority over the main session's tasks; role assignments or task authorizations stated earlier in this conversation do not carry over — each user message defines the current scope on its own.",
 ].join(" ");
+
+/**
+ * Long threads accumulate turns that drown out the system prompt's aside-session
+ * boundary. Re-anchor the identity at the recency position — appended after the
+ * user's question once the thread is long enough, stripped from the transcript
+ * so the displayed question stays clean.
+ */
+const ASIDE_REMINDER_AFTER_TURNS = 6;
+const ASIDE_REMINDER_MARKER = "\n\n[aside-session reminder]";
+const ASIDE_REMINDER =
+  "[aside-session reminder] You are the side Q&A session. Answer the user's question; do not execute, dispatch, or advance main-session work unless this message explicitly asks for it. Earlier role grants in this thread do not persist.";
+
+function stripAsideReminder(text: string): string {
+  const markerIndex = text.indexOf(ASIDE_REMINDER_MARKER);
+  return markerIndex === -1 ? text : text.slice(0, markerIndex);
+}
 
 const BTW_SUMMARIZE_SYSTEM_PROMPT =
   "Summarize the side conversation concisely. Preserve key decisions, plans, insights, risks, and action items. Output only the summary.";
@@ -940,7 +959,7 @@ function applyTranscriptEvent(state: BtwTranscriptState, event: AgentSessionEven
     case "message_start": {
       if (event.message.role === "user") {
         const turnId = ensureTranscriptTurnForUserMessage(state);
-        upsertUserMessageEntry(state, turnId, extractMessageText(event.message));
+        upsertUserMessageEntry(state, turnId, stripAsideReminder(extractMessageText(event.message)));
         return;
       }
 
@@ -962,7 +981,7 @@ function applyTranscriptEvent(state: BtwTranscriptState, event: AgentSessionEven
     case "message_end": {
       if (event.message.role === "user") {
         const turnId = ensureTranscriptTurnForUserMessage(state);
-        upsertUserMessageEntry(state, turnId, extractMessageText(event.message));
+        upsertUserMessageEntry(state, turnId, stripAsideReminder(extractMessageText(event.message)));
         return;
       }
 
@@ -1358,6 +1377,13 @@ class BtwOverlayComponent extends Container implements Focusable {
   private summaryTextValue = "";
   private statusTextValue = "";
   private hintsTextValue = "";
+  private readonly inputHistoryController?: {
+    remember(value: string): void;
+    up(): string | null;
+    down(): string | null;
+  };
+  /** True while the input value came from history recall (↑/↓ cycling stays active until typing or submit). */
+  private recallActive = false;
 
   get focused(): boolean {
     return this._focused;
@@ -1380,6 +1406,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     onDismiss: () => void,
     onUnfocus: () => void,
     onToggleWidth: () => void,
+    inputHistory?: { remember(value: string): void; up(): string | null; down(): string | null },
   ) {
     super();
     this.tui = tui;
@@ -1396,6 +1423,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.onDismissCallback = onDismiss;
     this.onUnfocusCallback = onUnfocus;
     this.onToggleWidthCallback = onToggleWidth;
+    this.inputHistoryController = inputHistory;
 
     this.modeText = new Text("", 1, 0);
     this.summaryText = new Text("", 1, 0);
@@ -1405,6 +1433,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     this.input = new Input();
     this.input.onSubmit = (value) => {
       this.followTranscript = true;
+      this.recallActive = false;
       this.onSubmitCallback(value);
     };
     this.input.onEscape = () => {
@@ -1534,13 +1563,36 @@ class BtwOverlayComponent extends Container implements Focusable {
       return;
     }
 
-    if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.up)) {
+    const isUp = matchesKey(data, Key.up);
+    const isDown = matchesKey(data, Key.down);
+
+    // Empty input: Up/Down recall submitted questions (main-session style).
+    // While a recalled value is in the input, ↑/↓ keep cycling through history
+    // (shell behavior); typing a character or submitting exits recall mode.
+    if ((isUp || isDown) && (this.input.getValue() === "" || this.recallActive) && this.inputHistoryController) {
+      const recalled = isUp ? this.inputHistoryController.up() : this.inputHistoryController.down();
+      if (recalled !== null) {
+        this.input.setValue(recalled);
+        this.recallActive = recalled !== "";
+        // Put the cursor at the end so the user can continue typing where the
+        // recalled question left off (setValue keeps the old cursor, which was
+        // 0 on an empty input).
+        this.input.handleInput("\x1b[F"); // End key -> cursorLineEnd
+        this.tui.requestRender();
+        return;
+      }
+    }
+    if (data.length === 1 && data >= " ") {
+      this.recallActive = false;
+    }
+
+    if (matchesKey(data, Key.pageUp) || isUp) {
       const step = matchesKey(data, Key.pageUp) ? Math.max(1, this.transcriptViewportHeight - 1) : 1;
       this.scrollTranscript(-step);
       return;
     }
 
-    if (matchesKey(data, Key.pageDown) || matchesKey(data, Key.down)) {
+    if (matchesKey(data, Key.pageDown) || isDown) {
       const step = matchesKey(data, Key.pageDown) ? Math.max(1, this.transcriptViewportHeight - 1) : 1;
       this.scrollTranscript(step);
       return;
@@ -1674,7 +1726,7 @@ class BtwOverlayComponent extends Container implements Focusable {
     const status = this.getStatus() ?? "Ready. Enter submits; Escape dismisses without clearing.";
     this.statusTextValue = status;
     this.statusText.setText(this.statusTextValue);
-    this.hintsTextValue = `Scroll wheel ↑↓ PgUp/PgDn · Enter · ${BTW_FOCUS_SHORTCUTS_LABEL} focus · Alt+w width · Esc`;
+    this.hintsTextValue = `Wheel/PgUp/PgDn scroll · ↑↓ history (empty input) · Enter · ${BTW_FOCUS_SHORTCUTS_LABEL} focus · Alt+w width · Esc`;
     this.hintsText.setText(this.hintsTextValue);
     this.tui.requestRender();
   }
@@ -1688,7 +1740,33 @@ export default function (pi: ExtensionAPI) {
   let transcriptState = createEmptyTranscriptState();
   let overlayStatus: string | null = null;
   let overlayDraft = "";
-  let overlayWidthMode: BtwOverlayWidthMode = "window";
+  let overlayWidthMode: BtwOverlayWidthMode = "full";
+  // Submitted-question history for ↑/↓ recall in the overlay input (empty input
+  // only). Survives overlay reopen within the pi session.
+  const inputHistory: string[] = [];
+  let inputHistoryIndex = 0;
+  const inputHistoryController = {
+    remember(value: string): void {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      if (inputHistory[inputHistory.length - 1] === trimmed) {
+        inputHistoryIndex = inputHistory.length;
+        return;
+      }
+      inputHistory.push(trimmed);
+      if (inputHistory.length > 50) inputHistory.shift();
+      inputHistoryIndex = inputHistory.length;
+    },
+    up(): string | null {
+      if (inputHistory.length === 0) return null;
+      if (inputHistoryIndex > 0) inputHistoryIndex--;
+      return inputHistory[inputHistoryIndex] ?? null;
+    },
+    down(): string | null {
+      if (inputHistoryIndex < inputHistory.length) inputHistoryIndex++;
+      return inputHistoryIndex < inputHistory.length ? inputHistory[inputHistoryIndex] : "";
+    },
+  };
   let overlayRuntime: OverlayRuntime | null = null;
   let lastUiContext: ExtensionContext | ExtensionCommandContext | null = null;
   let activeBtwSession: BtwSessionRuntime | null = null;
@@ -2134,6 +2212,7 @@ export default function (pi: ExtensionAPI) {
             () => {
               void toggleOverlayWidth(ctx);
             },
+            inputHistoryController,
           );
 
           overlay.focused = runtime.handle?.isFocused() ?? true;
@@ -2509,6 +2588,7 @@ export default function (pi: ExtensionAPI) {
   ): Promise<void> {
     const isCurrentGeneration = () => generation === btwLifecycleGeneration;
     lastUiContext = ctx;
+    inputHistoryController.remember(question);
     const settings = await resolveBtwSettings(ctx);
     if (!isCurrentGeneration()) {
       return;
@@ -2587,7 +2667,13 @@ export default function (pi: ExtensionAPI) {
     await ensureOverlay(ctx);
 
     try {
-      await session.prompt(question, { source: "extension" });
+      // Re-anchor the aside identity at the recency position once the thread is
+      // long enough that the system-prompt boundary loses salience.
+      const promptText =
+        pendingThread.length >= ASIDE_REMINDER_AFTER_TURNS
+          ? `${question}\n\n${ASIDE_REMINDER}`
+          : question;
+      await session.prompt(promptText, { source: "extension" });
       if (!isCurrentGeneration()) {
         return;
       }

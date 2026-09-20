@@ -213,3 +213,41 @@ pi -e /path/to/pi-btw
 ## License
 
 MIT
+
+## Local fork maintenance (kunrenzhilu)
+
+This fork carries a **local mainline branch: `tom/local-main`** — it is the
+install ref (see `pi install git:github.com/kunrenzhilu/pi-btw@tom/local-main`)
+and contains upstream main plus local features that are NOT all upstreamed:
+
+- aside-identity anchoring: strengthened system-prompt clauses, fresh-seed
+  identity exchange (`/btw:new`), per-turn reminder from the 7th exchange
+- aborted turns persist as `btw-thread-entry` (marked `aborted`)
+- full-width overlay **default** (Alt+w still toggles to the framed window)
+- ArrowUp/Down question recall in the overlay input
+
+**Sync flow** (whenever upstream publishes a new release):
+
+```bash
+cd ~/Git/pi-btw
+git remote add upstream https://github.com/dbachelder/pi-btw.git  # once
+git fetch upstream
+git checkout tom/local-main
+git rebase upstream/main        # or merge; expect conflicts — btw.ts gets restructured
+npx tsc --noEmit && npx vitest --run
+git push origin tom/local-main  # force-push if rebased
+pi install git:github.com/kunrenzhilu/pi-btw@tom/local-main
+```
+
+Notes:
+- `pi install` runs `git reset --hard` inside the install cache
+  (`~/.pi/agent/git/...`), which a local codex git-policy shim blocks. Either
+  whitelist that path in the shim or finish the update manually with
+  `/usr/bin/git reset --hard origin/tom/local-main`.
+- Local features MUST land as commits on `tom/local-main` (or feature branches
+  merged into it). Never hot-patch the installed copy under
+  `~/.pi/agent/git/...` or `~/.pi/agent/npm/...` — hot patches are invisible to
+  git and get destroyed on the next install.
+- Historical feature branches (`local/install`, `feat/overlay-full-width`,
+  `feat/esc-abort-then-dismiss`) are kept for reference; everything of value
+  has been ported onto `tom/local-main`.

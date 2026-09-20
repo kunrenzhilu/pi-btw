@@ -4,6 +4,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import btwExtension, {
   describeFocusShortcuts,
   isValidFocusShortcut,
+  renderMainTranscript,
   resolveBtwFocusShortcuts,
 } from "../extensions/btw";
 
@@ -1244,9 +1245,12 @@ describe("btw runtime behavior", () => {
     await harness.command("btw", "contextual start");
 
     const seedTexts = subSessionRecords[0].seedMessages.map((message) => (message.content[0] as any)?.text ?? "");
-    expect(seedTexts).toContain("main session task");
-    expect(seedTexts).toContain("main session answer");
-    expect(seedTexts).not.toContain("saved btw note");
+    const transcriptText = seedTexts.find((text) => text.includes("MAIN SESSION TRANSCRIPT")) ?? "";
+    // Main history is embedded in ONE reference document, not as raw messages.
+    expect(transcriptText).toContain("--- [main] user ---\nmain session task");
+    expect(transcriptText).toContain("--- [main] assistant ---\nmain session answer");
+    expect(transcriptText).not.toContain("saved btw note");
+    expect(seedTexts.join("\n")).not.toContain("saved btw note");
   });
 
   it("switching to tangent recreates the sub-session without inherited main-session context", async () => {
@@ -1262,7 +1266,7 @@ describe("btw runtime behavior", () => {
     await harness.runSessionStart();
     await harness.command("btw", "contextual start");
     const contextualRecord = subSessionRecords[0];
-    expect(contextualRecord.seedMessages.map((message) => (message.content[0] as any)?.text ?? "")).toContain(
+    expect(contextualRecord.seedMessages.map((message) => (message.content[0] as any)?.text ?? "").join("\n")).toContain(
       "main session task",
     );
 
@@ -1675,6 +1679,28 @@ describe("btw runtime behavior", () => {
     expect(harness.sentUserMessages[0]?.content).toContain("completed follow-up");
     expect(harness.sentUserMessages[0]?.content).toContain("Follow-up answer");
     expect(harness.sentUserMessages[0]?.content).not.toContain("aborted question");
+  });
+
+  it("does not leak main-session transcript text into the handoff injection", async () => {
+    const harness = createHarness([
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "text", text: "secret main detail xyz" }],
+        timestamp: Date.now(),
+      } as unknown as SessionEntry,
+    ]);
+    promptStreamMock.mockImplementation(() => streamAnswer("aside answer for handoff"));
+
+    await harness.runSessionStart();
+    await harness.command("btw", "aside question");
+    await flushAsyncWork();
+    await harness.command("btw:inject", "");
+
+    expect(harness.sentUserMessages[0]?.content).toContain("aside question");
+    expect(harness.sentUserMessages[0]?.content).toContain("aside answer for handoff");
+    expect(harness.sentUserMessages[0]?.content).not.toContain("secret main detail xyz");
+    expect(harness.sentUserMessages[0]?.content).not.toContain("MAIN SESSION TRANSCRIPT");
   });
 
   it("anchors the aside identity at the end of a fresh contextual seed and excludes it from handoff", async () => {
@@ -3124,6 +3150,90 @@ describe("btw runtime behavior", () => {
     }
   });
 });
+describe("renderMainTranscript", () => {
+  const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
+  const assistant = (blocks: any[]) => ({ role: "assistant", content: blocks });
+
+  it("renders an empty string for empty history", () => {
+    expect(renderMainTranscript([])).toBe("");
+  });
+
+  it("drops thinking blocks and keeps visible text and tool calls", () => {
+    const out = renderMainTranscript([
+      assistant([
+        { type: "thinking", thinking: "secret reasoning" },
+        { type: "text", text: "visible answer" },
+        { type: "toolCall", name: "bash", arguments: { command: "ls" } },
+      ]),
+    ]);
+    expect(out).toContain("--- [main] assistant ---\nvisible answer");
+    expect(out).toContain("--- [main] assistant → tool call: bash ---");
+    expect(out).toContain('"command":"ls"');
+    expect(out).not.toContain("secret reasoning");
+  });
+
+  it("head-truncates oversized tool call arguments with an explicit marker", () => {
+    const out = renderMainTranscript([
+      assistant([{ type: "toolCall", name: "write", arguments: { content: "x".repeat(3000) } }]),
+    ]);
+    expect(out).toContain("…[truncated，共 ");
+    expect(out.length).toBeLessThan(3000 + 200);
+  });
+
+  it("tail-keeps oversized tool results (head 1000 + tail 3000)", () => {
+    const body = `${"A".repeat(1500)}${"B".repeat(3200)}ERROR-AT-END`;
+    const out = renderMainTranscript([{ role: "toolResult", content: [{ type: "text", text: body }] }]);
+    expect(out).toContain("ERROR-AT-END");
+    expect(out).toContain("…[truncated，共 ");
+    expect(out).toContain("A".repeat(1000));
+    expect(out).toContain("B".repeat(2900)); // 尾 3000 中含 ERROR-AT-END 的 12 个字符
+    expect(out).not.toContain("A".repeat(1500));
+  });
+
+  it("renders compaction, branch summary and bash execution entries", () => {
+    const out = renderMainTranscript([
+      { role: "compactionSummary", summary: "earlier work summarized" },
+      { role: "branchSummary", summary: "branch context" },
+      { role: "bashExecution", command: "make test", output: "all passed", exitCode: 0 },
+    ]);
+    expect(out).toContain("--- [main] session compacted ---\nearlier work summarized");
+    expect(out).toContain("--- [main] branch summary ---\nbranch context");
+    expect(out).toContain("--- [main] bash execution ---");
+    expect(out).toContain("Ran `make test`");
+    expect(out).toContain("all passed");
+  });
+
+  it("skips custom entries and placeholders images", () => {
+    const out = renderMainTranscript([
+      { role: "custom", customType: "model_change" },
+      user("see screenshot"),
+      { role: "user", content: [{ type: "image" }] },
+    ]);
+    expect(out).toContain("[image omitted]");
+    expect(out).toContain("see screenshot");
+    expect(out).not.toContain("model_change");
+  });
+
+  it("hard-cuts at the global cap keeping the tail, marking halved and omitted spans", () => {
+    const messages = [
+      user("OLD-HEAD-".repeat(25000)),
+      user("NEWEST-TAIL-MARKER"),
+ ];
+    const out = renderMainTranscript(messages);
+    expect(out.length).toBeLessThanOrEqual(200_000);
+    expect(out).toContain("NEWEST-TAIL-MARKER");
+    // 225k chars 的旧条目独自击穿预算 → 走腰斩路径（保留其尾部）
+    expect(out).toContain("[... 当前条目过长已被腰斩 ...]");
+    expect(out).toContain("[MAIN SESSION TRANSCRIPT");
+  });
+
+  it("includes the framing header with the untrusted-data warning", () => {
+    const out = renderMainTranscript([user("hello")]);
+    expect(out).toContain("[MAIN SESSION TRANSCRIPT — reference only]");
+    expect(out).toContain("不受信数据");
+  });
+});
+
 describe("configurable BTW focus shortcuts", () => {
   it("uses the built-in defaults when PI_BTW_FOCUS_KEYS is unset or blank", () => {
     expect(resolveBtwFocusShortcuts({})).toEqual(["alt+/", "super+/", "ctrl+alt+w"]);

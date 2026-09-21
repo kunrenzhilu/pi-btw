@@ -2,8 +2,10 @@ import {
   buildSessionContext,
   createAgentSession,
   createExtensionRuntime,
+  ModelRuntime,
   SessionManager,
   type AgentSession,
+  type CreateAgentSessionOptions,
   type AgentSessionEvent,
   type ExtensionAPI,
   type ExtensionCommandContext,
@@ -186,9 +188,46 @@ function createBtwResourceLoader(
     getAgentsFiles: () => ({ agentsFiles: [] }),
     getSystemPrompt: () => systemPrompt,
     getAppendSystemPrompt: () => appendSystemPrompt,
+    getSystemPromptSource: () => undefined,
+    getAppendSystemPromptSources: () => [],
     extendResources: () => {},
     reload: async () => {},
   };
+}
+
+// Ported verbatim from 0.5.0 (tom/local-main): pi >= 0.85 replaced the
+// `modelRegistry` option of createAgentSession with an explicit ModelRuntime.
+// This builds one from the main session's registry so the aside sub-session
+// resolves provider config and runtime API keys exactly like the main thread.
+async function createBtwModelRuntimeOptions(
+  ctx: ExtensionCommandContext,
+  model: SessionModel,
+): Promise<Pick<CreateAgentSessionOptions, "modelRuntime">> {
+  const nativeProvider = ctx.modelRegistry.getRegisteredNativeProvider(model.provider);
+  const providerConfig = ctx.modelRegistry.getRegisteredProviderConfig(model.provider);
+  const hasRuntimeApiKey = ctx.modelRegistry.getProviderAuthStatus(model.provider).source === "runtime";
+
+  if (!nativeProvider && !providerConfig && !hasRuntimeApiKey) {
+    return {};
+  }
+
+  const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false });
+  if (nativeProvider) {
+    modelRuntime.registerNativeProvider(nativeProvider);
+  } else if (providerConfig) {
+    modelRuntime.registerProvider(model.provider, providerConfig);
+  }
+  await modelRuntime.refresh({ allowNetwork: false });
+
+  // --api-key is stored only in the parent runtime.
+  if (hasRuntimeApiKey) {
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (auth.ok && auth.apiKey) {
+      await modelRuntime.setRuntimeApiKey(model.provider, auth.apiKey);
+    }
+  }
+
+  return { modelRuntime };
 }
 
 function extractText(parts: AssistantMessage["content"], type: "text" | "thinking"): string {
@@ -1698,7 +1737,7 @@ export default function (pi: ExtensionAPI) {
     const { session } = await createAgentSession({
       sessionManager: SessionManager.inMemory(),
       model: settings.model,
-      modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
+      ...(await createBtwModelRuntimeOptions(ctx, settings.model)),
       thinkingLevel: settings.thinkingLevel,
       // Match pi's default coding-agent toolset (read/bash/edit/write).
       tools: ["read", "bash", "edit", "write"],
@@ -2286,7 +2325,7 @@ export default function (pi: ExtensionAPI) {
     const { session } = await createAgentSession({
       sessionManager: SessionManager.inMemory(),
       model,
-      modelRegistry: ctx.modelRegistry as AgentSession["modelRegistry"],
+      ...(await createBtwModelRuntimeOptions(ctx, model)),
       thinkingLevel: "off",
       tools: [],
       resourceLoader: createBtwResourceLoader(ctx, [BTW_SUMMARIZE_SYSTEM_PROMPT]),

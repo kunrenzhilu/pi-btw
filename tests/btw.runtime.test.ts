@@ -608,6 +608,11 @@ function createHarness(
         if (known) return known;
         return { provider, id, api: "anthropic-messages" } as any;
       }),
+      // pi >= 0.85: createBtwModelRuntimeOptions probes these; returning nothing
+      // keeps the default no-modelRuntime path (same behavior as pre-port).
+      getRegisteredNativeProvider: vi.fn(() => undefined),
+      getRegisteredProviderConfig: vi.fn(() => undefined),
+      getProviderAuthStatus: vi.fn(() => ({ configured: false })),
     },
     model,
     getSystemPrompt: () => "system",
@@ -723,7 +728,9 @@ describe("btw runtime behavior", () => {
 
     const options = createAgentSessionMock.mock.calls[0][0];
     expect(options.model).toBe(harness.baseCtx.model);
-    expect(options.modelRegistry).toBe(harness.baseCtx.modelRegistry);
+    // pi >= 0.85 removed the modelRegistry option; provider/auth flow goes
+    // through a ModelRuntime built by createBtwModelRuntimeOptions instead.
+    expect(options.modelRegistry).toBeUndefined();
     expect(options.tools).toEqual(["read", "bash", "edit", "write"]);
     expect(options.resourceLoader.getAppendSystemPrompt()[0]).toContain(
       "You are having an aside conversation with the user, separate from their main working session.",

@@ -56,6 +56,14 @@ const BTW_SUMMARIZE_SYSTEM_PROMPT =
 const BTW_CONTINUE_THREAD_USER_TEXT = "[The following is a separate side conversation. Continue this thread.]";
 const BTW_CONTINUE_THREAD_ASSISTANT_TEXT = "Understood, continuing our side conversation.";
 
+// Identity anchor for a FRESH contextual thread (/btw:new): the seed still ends with
+// the entire main-session history, so without a recent aside-identity signal the model
+// answers "I am the main session". This exchange sits at the recency end of the seed.
+const BTW_FRESH_THREAD_USER_TEXT =
+  "[aside-session identity] The conversation above is the main session's history, provided for context only — that work belongs to another agent. You are the aside session: answer the user's questions; do not act as the main-session agent or continue its work.";
+const BTW_FRESH_THREAD_ASSISTANT_TEXT =
+  "Understood. I am the aside session, not the main-session agent. I'll answer from that context without advancing the main work.";
+
 type SessionThinkingLevel = "off" | AiThinkingLevel;
 type BtwThreadMode = "contextual" | "tangent";
 type SessionModel = NonNullable<ExtensionCommandContext["model"]>;
@@ -389,6 +397,34 @@ function buildBtwSeedState(
         },
       );
     }
+  } else if (mode === "contextual") {
+    // Fresh contextual thread: the seed is pure main-session history, so anchor the
+    // aside identity at the recency end (otherwise the model identifies as the
+    // main-session agent — the history IS its own past messages at that point).
+    messages.push(
+      {
+        role: "user",
+        content: [{ type: "text", text: BTW_FRESH_THREAD_USER_TEXT }],
+        timestamp: Date.now(),
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: BTW_FRESH_THREAD_ASSISTANT_TEXT }],
+        provider: sessionModel?.provider ?? "unknown",
+        model: sessionModel?.id ?? "unknown",
+        api: sessionModel?.api ?? "openai-responses",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      },
+    );
   }
 
   return {
@@ -974,20 +1010,25 @@ function formatThread(thread: BtwHandoffExchange[]): string {
   return thread.map((entry) => `User: ${entry.user.trim()}\nAssistant: ${entry.assistant.trim()}`).join("\n\n---\n\n");
 }
 
-function isThreadContinuationMarker(messages: Message[], index: number): boolean {
+function isBtwSeedMarkerPair(messages: Message[], index: number): boolean {
   const userMessage = messages[index];
   const assistantMessage = messages[index + 1];
+  if (userMessage?.role !== "user" || assistantMessage?.role !== "assistant") {
+    return false;
+  }
+  const userText = extractMessageText(userMessage);
+  const assistantText = extractMessageText(assistantMessage);
   return (
-    userMessage?.role === "user" &&
-    extractMessageText(userMessage) === BTW_CONTINUE_THREAD_USER_TEXT &&
-    assistantMessage?.role === "assistant" &&
-    extractMessageText(assistantMessage) === BTW_CONTINUE_THREAD_ASSISTANT_TEXT
+    (userText === BTW_CONTINUE_THREAD_USER_TEXT && assistantText === BTW_CONTINUE_THREAD_ASSISTANT_TEXT) ||
+    (userText === BTW_FRESH_THREAD_USER_TEXT && assistantText === BTW_FRESH_THREAD_ASSISTANT_TEXT)
   );
 }
 
 function extractBtwHandoffThread(sessionRuntime: BtwSessionRuntime): BtwHandoffExchange[] {
   const handoffMessages = sessionRuntime.session.state.messages.slice(sessionRuntime.sideThreadStartIndex);
-  const threadMessages = isThreadContinuationMarker(handoffMessages as Message[], 0) ? handoffMessages.slice(2) : handoffMessages;
+  const threadMessages = isBtwSeedMarkerPair(handoffMessages as Message[], 0)
+    ? handoffMessages.slice(2)
+    : handoffMessages;
   const exchanges: BtwHandoffExchange[] = [];
   let currentUser = "";
   let currentAssistant = "";

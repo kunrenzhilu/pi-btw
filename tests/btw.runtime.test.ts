@@ -1810,6 +1810,33 @@ describe("btw runtime behavior", () => {
     expect(harness.baseCtx.isIdle()).toBe(true);
   });
 
+  it("restores mouse reporting: focus follows the wheel, dispose always releases", async () => {
+    const harness = createHarness();
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    expect(harness.terminalWrites.some((w: string) => w.includes("\x1b[?1000h"))).toBe(true);
+
+    const overlay = harness.latestOverlayComponent();
+    const lastMouseWrite = () => {
+      for (let i = harness.terminalWrites.length - 1; i >= 0; i--) {
+        const w = harness.terminalWrites[i];
+        if (w.includes("?1000")) return w;
+      }
+      return "";
+    };
+
+    overlay.focused = false;
+    expect(lastMouseWrite()).toContain("\x1b[?1000l");
+
+    overlay.focused = true;
+    expect(lastMouseWrite()).toContain("\x1b[?1000h");
+
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+    expect(lastMouseWrite()).toContain("\x1b[?1000l");
+  });
+
   it("dismisses immediately on Escape when the side session is idle", async () => {
     const harness = createHarness();
 

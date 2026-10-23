@@ -1068,8 +1068,25 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   set focused(value: boolean) {
+    if (this._focused === value) {
+      return;
+    }
     this._focused = value;
     this.input.focused = value;
+    // Mouse reporting follows focus: while the overlay is focused we capture
+    // the wheel for transcript scrolling; the moment focus moves back to the
+    // main editor (Alt+/) the terminal gets its native wheel scrolling back.
+    this.setMouseReporting(value);
+  }
+
+  private mouseReporting = false;
+
+  private setMouseReporting(enabled: boolean): void {
+    if (this.mouseReporting === enabled) {
+      return;
+    }
+    this.mouseReporting = enabled;
+    this.tui.terminal?.write?.(enabled ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l");
   }
 
   constructor(
@@ -1111,8 +1128,8 @@ class BtwOverlayComponent extends Container implements Focusable {
 
     this.hintsText = new Text("", 1, 0);
 
-    // Enable SGR mouse reporting so wheel/touchpad events reach handleInput().
-    this.tui.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
+    // Mouse reporting is enabled via setMouseReporting(true) when the overlay
+    // becomes focused (see the focused setter).
 
     const originalHandleInput = this.input.handleInput.bind(this.input);
     this.input.handleInput = (data: string) => {
@@ -1179,7 +1196,7 @@ class BtwOverlayComponent extends Container implements Focusable {
   }
 
   dispose(): void {
-    this.tui.terminal?.write?.("\x1b[?1000l\x1b[?1006l");
+    this.setMouseReporting(false);
   }
 
   private getMouseScrollDelta(data: string): number | null {

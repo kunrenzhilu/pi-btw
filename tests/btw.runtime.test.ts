@@ -481,7 +481,8 @@ function createHarness(
   const sentUserMessages: Array<{ content: unknown; options?: unknown }> = [];
   const overlayHandles: FakeOverlayHandle[] = [];
   const overlays: Array<{ factoryOptions?: unknown; done?: (result: unknown) => void; component?: any }> = [];
-  const tui = { requestRender: vi.fn() };
+  const terminalWrites: string[] = [];
+  const tui = { requestRender: vi.fn(), terminal: { write: (s: string) => terminalWrites.push(s) } };
   const theme = options.theme ?? {
     fg: (_name: string, text: string) => text,
     bg: (_name: string, text: string) => text,
@@ -671,6 +672,7 @@ function createHarness(
     sentUserMessages,
     overlayHandles,
     overlays,
+    terminalWrites,
     baseCtx,
     mainSessionInputs,
     runSessionStart,
@@ -1173,6 +1175,42 @@ describe("btw runtime behavior", () => {
       source: "extension",
     });
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
+  });
+
+  it("restores mouse reporting (disables 1000h/1006h) after overlay dismissal", async () => {
+    const harness = createHarness();
+    await harness.runSessionStart();
+    await harness.command("btw", "");
+
+    const mouseOn = harness.terminalWrites.some((w: string) => w.includes("\x1b[?1000h"));
+    expect(mouseOn).toBe(true);
+
+    const overlay = harness.latestOverlayComponent();
+    overlay.input.onEscape?.();
+    await flushAsyncWork();
+
+    const mouseOff = harness.terminalWrites.some((w: string) => w.includes("\x1b[?1000l"));
+    expect(mouseOff).toBe(true);
+
+    // Focus follows the wheel: the LAST mouse-mode write tracks focus state.
+    // Unfocused overlay releases reporting (main editor gets native wheel
+    // scrolling back); refocusing recaptures; dispose always releases.
+    const lastMouseWrite = () => {
+      for (let i = harness.terminalWrites.length - 1; i >= 0; i--) {
+        const w = harness.terminalWrites[i];
+        if (w.includes("?1000")) return w;
+      }
+      return "";
+    };
+
+    overlay.focused = false;
+    expect(lastMouseWrite()).toContain("\x1b[?1000l");
+
+    overlay.focused = true;
+    expect(lastMouseWrite()).toContain("\x1b[?1000h");
+
+    overlay.dispose();
+    expect(lastMouseWrite()).toContain("\x1b[?1000l");
   });
 
   it("dismisses immediately on Escape when the side session is idle", async () => {

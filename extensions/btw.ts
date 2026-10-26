@@ -44,6 +44,14 @@ const BTW_ENTRY_TYPE = "btw-thread-entry";
 const BTW_RESET_TYPE = "btw-thread-reset";
 const BTW_MODEL_OVERRIDE_TYPE = "btw-model-override";
 const BTW_THINKING_OVERRIDE_TYPE = "btw-thinking-override";
+
+/**
+ * Minimum interval between overlay transcript rebuilds (see scheduleOverlayRefresh).
+ * Each rebuild re-renders the whole thread transcript, and btw session events
+ * arrive per streaming delta, so rebuilds are coalesced to this cadence.
+ * Exported so tests can wait out the throttle window deterministically.
+ */
+export const OVERLAY_REFRESH_MIN_INTERVAL_MS = 250;
 const BTW_DEFAULT_FOCUS_SHORTCUTS: readonly KeyId[] = [Key.alt("/"), Key.super("/"), Key.ctrlAlt("w")];
 const BTW_FOCUS_KEYS_ENV = "PI_BTW_FOCUS_KEYS";
 const BTW_FOCUS_MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
@@ -1988,6 +1996,45 @@ export default function (pi: ExtensionAPI) {
   let btwLifecycleGeneration = 0;
   let btwSubmissionQueue = Promise.resolve();
 
+  // Overlay rebuilds are expensive: refresh() re-renders the whole thread
+  // transcript (markdown + ANSI wrap). Btw session events arrive per streaming
+  // delta, so rebuilding on every event is O(thread) per token and pegs the
+  // event loop on long threads. Coalesce refreshes instead: bursts collapse
+  // into one trailing rebuild per OVERLAY_REFRESH_MIN_INTERVAL_MS.
+  let lastOverlayRefreshAt = 0;
+  let overlayRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let overlayRefreshTimerRuntime: OverlayRuntime | null = null;
+
+  function scheduleOverlayRefresh(): void {
+    const runtime = overlayRuntime;
+    const refresh = runtime?.refresh;
+    if (!refresh) {
+      return;
+    }
+    if (overlayRefreshTimer) {
+      // A pending timer bound to an older runtime generation would drop this
+      // update (its guard skips the stale runtime) with no later event to
+      // reschedule — e.g. a status set right after Alt+w re-opens the overlay.
+      // Replace it instead of letting it swallow the refresh.
+      if (overlayRefreshTimerRuntime === runtime) {
+        return;
+      }
+      clearTimeout(overlayRefreshTimer);
+      overlayRefreshTimer = null;
+    }
+    const delay = Math.max(0, OVERLAY_REFRESH_MIN_INTERVAL_MS - (Date.now() - lastOverlayRefreshAt));
+    overlayRefreshTimerRuntime = runtime;
+    overlayRefreshTimer = setTimeout(() => {
+      overlayRefreshTimer = null;
+      overlayRefreshTimerRuntime = null;
+      lastOverlayRefreshAt = Date.now();
+      // The overlay may have been closed or reopened while pending.
+      if (overlayRuntime === runtime) {
+        refresh();
+      }
+    }, delay);
+  }
+
   function invalidateBtwLifecycle(): void {
     btwLifecycleGeneration += 1;
   }
@@ -1996,7 +2043,7 @@ export default function (pi: ExtensionAPI) {
     const activeCtx = ctx ?? lastUiContext;
     if (activeCtx?.hasUI) {
       activeCtx.ui.setWidget("btw", undefined);
-      overlayRuntime?.refresh?.();
+      scheduleOverlayRefresh();
     }
   }
 

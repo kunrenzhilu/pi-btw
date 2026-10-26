@@ -4,6 +4,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import btwExtension, {
   describeFocusShortcuts,
   isValidFocusShortcut,
+  OVERLAY_REFRESH_MIN_INTERVAL_MS,
   renderMainTranscript,
   resolveBtwFocusShortcuts,
 } from "../extensions/btw";
@@ -489,6 +490,40 @@ async function flushAsyncWork() {
   await Promise.resolve();
   await Promise.resolve();
   await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/**
+ * Flush pending work AND wait out the btw overlay rebuild throttle
+ * (scheduleOverlayRefresh coalesces refreshes to once per
+ * OVERLAY_REFRESH_MIN_INTERVAL_MS). Use this instead of flushAsyncWork
+ * before assertions that read overlay UI state (statusText/transcript)
+ * derived from recently dispatched session events.
+ */
+async function flushBtwOverlayRefresh() {
+  await flushAsyncWork();
+  await new Promise((resolve) => setTimeout(resolve, OVERLAY_REFRESH_MIN_INTERVAL_MS + 50));
+}
+
+/**
+ * Poll until the overlay UI shows the expected text. Needed when the update
+ * lands after an async chain whose completion time is not controlled by the
+ * test (e.g. toggleOverlayWidth re-opens the overlay, then sets its status via
+ * the throttled refresh path).
+ */
+async function waitForOverlayText(read: () => string, substring: string, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const text = read();
+    if (text.includes(substring)) {
+      return;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        `waitForOverlayText: timed out after ${timeoutMs}ms waiting for ${JSON.stringify(substring)}; last read: ${JSON.stringify(text.slice(0, 150))}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }
 
 function getCustomEntries(entries: SessionEntry[], customType: string): CustomEntry[] {
@@ -1298,6 +1333,7 @@ describe("btw runtime behavior", () => {
 
     await harness.runSessionStart();
     await harness.command("btw", "broken question");
+    await flushBtwOverlayRefresh();
 
     const overlay = harness.latestOverlayComponent();
     expect(overlay.statusText.text).toContain("Request failed. Thread preserved for retry or follow-up.");
@@ -1309,7 +1345,7 @@ describe("btw runtime behavior", () => {
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(0);
 
     overlay.input.onSubmit?.("retry question");
-    await flushAsyncWork();
+    await flushBtwOverlayRefresh();
 
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(1);
     expect(transcriptText(overlay)).toContain("Recovered answer");
@@ -1385,7 +1421,7 @@ describe("btw runtime behavior", () => {
 
     await harness.runSessionStart();
     const pendingCommand = harness.command("btw", "first question");
-    await flushAsyncWork();
+    await flushBtwOverlayRefresh();
 
     const overlay = harness.latestOverlayComponent();
     expect(overlay.statusText.text).toContain("running tool: read");
@@ -1397,7 +1433,7 @@ describe("btw runtime behavior", () => {
 
     // First Escape: abort the in-flight request, keep the overlay open.
     overlay.input.onEscape?.();
-    await flushAsyncWork();
+    await flushBtwOverlayRefresh();
 
     expect(firstRecord.session.abort).toHaveBeenCalledTimes(1);
     expect(firstRecord.session.dispose).not.toHaveBeenCalled();
@@ -1409,6 +1445,7 @@ describe("btw runtime behavior", () => {
     // its partial user/tool transcript remains readable.
     blocking.release();
     await pendingCommand;
+    await flushBtwOverlayRefresh();
     expect(firstRecord.getIsStreaming()).toBe(false);
     const abortedEntries = getCustomEntries(harness.entries, "btw-thread-entry");
     expect(abortedEntries).toHaveLength(1);
@@ -1418,7 +1455,7 @@ describe("btw runtime behavior", () => {
 
     // The same side session remains usable for a successful follow-up.
     overlay.input.onSubmit?.("follow-up after abort");
-    await flushAsyncWork();
+    await flushBtwOverlayRefresh();
 
     expect(firstRecord.session.prompt).toHaveBeenLastCalledWith("follow-up after abort", { source: "extension" });
     expect(getCustomEntries(harness.entries, "btw-thread-entry")).toHaveLength(2);
@@ -1799,7 +1836,7 @@ describe("btw runtime behavior", () => {
     });
 
     blocking.release();
-    await flushAsyncWork();
+    await flushBtwOverlayRefresh();
 
     expect(record.getIsStreaming()).toBe(false);
     expect(overlay.statusText.text).toContain("Ready for a follow-up");
@@ -2341,7 +2378,7 @@ describe("btw runtime behavior", () => {
     // Default is full-width; Alt+w (legacy ESC-prefixed) switches to the framed
     // window layout and re-opens the overlay.
     overlay.handleInput("\x1bw");
-    await flushAsyncWork();
+    await flushBtwOverlayRefresh();
 
     expect(harness.overlays.at(-1)?.factoryOptions?.overlayOptions).toMatchObject({
       width: "78%",
@@ -2349,11 +2386,12 @@ describe("btw runtime behavior", () => {
     });
     const windowOverlay = harness.latestOverlayComponent();
     expect(windowOverlay.getDraft()).toBe("kept draft");
+    await waitForOverlayText(() => harness.latestOverlayComponent().statusText.text, "Window mode");
     expect(windowOverlay.statusText.text).toContain("Window mode");
 
     // Alt+w again restores the full-width layout.
     await harness.shortcut("alt+w");
-    await flushAsyncWork();
+    await flushBtwOverlayRefresh();
 
     expect(harness.overlays.at(-1)?.factoryOptions?.overlayOptions).toMatchObject({
       width: "100%",
@@ -2361,6 +2399,7 @@ describe("btw runtime behavior", () => {
     });
     const fullOverlay = harness.latestOverlayComponent();
     expect(fullOverlay.getDraft()).toBe("kept draft");
+    await waitForOverlayText(() => harness.latestOverlayComponent().statusText.text, "Full-width mode");
     expect(fullOverlay.statusText.text).toContain("Full-width mode");
   });
 
@@ -2533,7 +2572,7 @@ describe("btw runtime behavior", () => {
     const emptyLines = overlay.render(80);
 
     overlay.input.onSubmit?.("first question");
-    await flushAsyncWork();
+    await flushBtwOverlayRefresh();
 
     const populatedLines = overlay.render(80);
     const emptyStateLine = emptyLines.find((line: string) => line.includes("No BTW thread yet."));
@@ -2703,7 +2742,7 @@ describe("btw runtime behavior", () => {
 
     await harness.runSessionStart();
     const pendingCommand = harness.command("btw", "long running tool");
-    await flushAsyncWork();
+    await flushBtwOverlayRefresh();
 
     const overlay = harness.latestOverlayComponent();
     const overlayHandle = harness.overlayHandles.at(-1);
